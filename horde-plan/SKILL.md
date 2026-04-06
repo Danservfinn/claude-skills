@@ -1,12 +1,13 @@
 ---
 name: horde-plan
-version: "1.2"
+version: "1.4"
 description: >
   Create comprehensive implementation plans optimized for horde-implement execution.
   Plans follow a strict output contract (heading levels, exit criteria, task type hints,
   gate depth signals) ensuring automatic parsing by horde-implement's Plan Parser.
   For complex projects, invokes golden-horde deliberation to validate architecture
   before task breakdown. Structured handoff with plan manifest for zero-loss execution.
+  Automatically saves finalized plans to disk as .md files.
 integrations:
   - horde-swarm
   - golden-horde
@@ -17,9 +18,17 @@ integrations:
 
 Create comprehensive implementation plans using plan mode with task breakdown, dependency mapping, and structured handoff to horde-implement for execution.
 
-**New in v1.2:** Plans now follow a strict **Plan Output Contract** ensuring zero-friction parsing by horde-implement. Heading levels, exit criteria, task type hints, gate depth signals, and YAML frontmatter plan manifest are all standardized. Plans produced by horde-plan v1.2 can be executed by horde-implement Path B without any manual reformatting.
+**New in v1.4:** Fixed plan-to-implementation handoff. ExitPlanMode is now called immediately (no redundant approval dialog) and horde-implement is auto-invoked. TaskCreate is used during planning to create implementation tasks that transfer to horde-implement.
+
+**v1.3:** Plans are now automatically saved to disk as `.md` files after user approval.
+
+**v1.2:** Plans now follow a strict **Plan Output Contract** ensuring zero-friction parsing by horde-implement.
 
 **v1.1:** Golden-horde pre-planning deliberation (Adversarial Debate, Consensus Deliberation) for complex projects. ADR constrains task breakdown.
+
+## Process Guard
+
+**Before dispatching agents**, run: `pgrep -fc "claude.*--disallowedTools"`. If count > 50, run `pkill -f "claude.*--disallowedTools"` first. This prevents orphaned subagent accumulation from causing ENFILE (file table overflow).
 
 ## Quick Start
 
@@ -31,10 +40,10 @@ Claude:
 1. Analyzes requirements + scores complexity
 2. Enters plan mode (EnterPlanMode)
 3. Creates task breakdown with phases
-4. Maps dependencies (TaskCreate with addBlockedBy)
-5. Generates plan.md
-6. Exits plan mode for approval (ExitPlanMode)
-7. Hands off to horde-implement for execution
+4. Creates TaskCreate entries for each phase (these transfer to horde-implement)
+5. Generates plan.md to plan file
+6. Calls ExitPlanMode immediately (no redundant approval dialog)
+7. Saves plan to docs/plans/ and auto-invokes horde-implement Path B
 ```
 
 **Validated Plan (complex projects):**
@@ -301,6 +310,12 @@ I'm using horde-plan to create an implementation plan.
 
 Before writing the plan, understand what needs to be built:
 
+0. **Consult the knowledge base FIRST** - Read `~/.openclaw/agents/main/knowledge/INDEX.md` to find relevant operational docs. Then read the matching knowledge files for the task domain:
+   - Task/Neo4j work → `neo4j-schema.md`
+   - API/server changes → `api-endpoints.md`
+   - Agent config/routing → `agent-roster.md`, `provider-fallback.md`
+   - Dashboard UI → `dashboard-views.md`
+   This prevents re-discovering known architecture and ensures plans align with existing systems.
 1. **Identify the core requirement** - What is being built?
 2. **Gather context** - Read relevant files, understand existing patterns
 3. **Identify constraints** - Technology choices, time constraints, dependencies
@@ -787,107 +802,91 @@ Phase 0 (Setup)
 
 **Save location:** `docs/plans/YYYY-MM-DD-[feature-name].md`
 
-### Phase 6: Exit Plan Mode
+### Phase 6: Create Implementation Tasks + Exit Plan Mode
 
-Present plan for user approval using ExitPlanMode:
+**IMPORTANT:** Do NOT present the plan for "approval" via ExitPlanMode — the user already reviewed and approved the plan during the planning conversation. ExitPlanMode is a mechanical step to unlock write access, not a second approval gate.
 
-```
-[ExitPlanMode invoked with:
-- allowedPrompts for any bash commands during implementation
-- pushToRemote if deployment is included
-]
+**Step 1: Create TaskCreate entries for each phase**
 
-Plan complete! Here's what I'll build:
-
-**Summary:** [2-3 sentence overview]
-**Tasks:** N total across N phases
-**Estimated effort:** [Time estimate]
-
-**Next Steps:**
-1. Review the plan above
-2. If approved, I'll use horde-implement to execute
-3. Each task will have review gates before proceeding
-4. Progress tracked via TaskList throughout
-
-Shall I proceed with execution?
-```
-
-## Structured Handoff to Horde-Implement
-
-After plan approval, the skill performs a **structured handoff** to `horde-implement` Path B (Execute mode). This eliminates re-discovery overhead — horde-implement receives a pre-parsed plan with full metadata.
-
-### Handoff Protocol
-
-**Step 1: Update plan manifest with TaskCreate IDs**
-
-After all tasks are created via TaskCreate during planning, update the YAML frontmatter:
+Before exiting plan mode, create tasks that will transfer to horde-implement:
 
 ```python
-# After all TaskCreate calls, collect IDs
-task_ids = [task1_id, task2_id, task3_id, ...]
+# Create a task for each phase in the plan
+task_ids = []
+for phase in plan_phases:
+    task = TaskCreate(
+        subject=f"Phase {phase.id}: {phase.name}",
+        description=f"{phase.task_count} tasks. Duration: {phase.duration}",
+        activeForm=f"Executing Phase {phase.id}"
+    )
+    task_ids.append(task.id)
 
-# Update the plan_manifest.task_transfer.task_ids in the saved plan file
-# (edit the YAML frontmatter to include actual task IDs)
+# Set up sequential dependencies
+for i in range(1, len(task_ids)):
+    TaskUpdate(taskId=task_ids[i], addBlockedBy=[task_ids[i-1]])
 ```
 
-**Step 2: Invoke horde-implement with structured prompt**
+**Step 2: Call ExitPlanMode immediately**
 
+Call ExitPlanMode right away — no "shall I proceed?" text, no AskUserQuestion. The plan is done; exit the lock.
+
+```python
+ExitPlanMode()  # No fanfare. Just exit.
 ```
-User: "Yes, proceed"
 
-Claude:
-Skill("horde-implement", """
+**Step 3: Save plan to disk + auto-invoke horde-implement**
+
+Immediately after ExitPlanMode succeeds:
+
+```python
+# Save plan
+plan_path = f"docs/plans/{date}-{slug}.md"
+Write(file_path=plan_path, content=plan_markdown)
+
+# Auto-invoke horde-implement Path B
+Skill("horde-implement", f"""
 Execute this plan via Path B (existing plan document).
 
-Plan: docs/plans/YYYY-MM-DD-[feature].md
+Plan: {plan_path}
 Entry: Path B (structured markdown with YAML frontmatter plan_manifest)
 
 The plan includes:
-- YAML frontmatter with phase index, gate depths, and task transfer IDs
 - {N} phases with ## Phase headers
-- {N} tasks with ### Task headers and typed content (bash/code/config/browser/verify)
-- Exit criteria per phase (### Exit Criteria Phase {id})
-- Dependency graph with gate depth annotations
+- {N} tasks with ### Task headers
+- Exit criteria per phase
 
-Task transfer mode: transfer
-TaskCreate IDs from planning: {task_ids}
-These tasks can be claimed via TaskUpdate(taskId=X, owner="horde-implement", status="in_progress")
+Task transfer: TaskCreate IDs {task_ids} are ready to claim.
 
-Proceed with phase-by-phase execution, gate testing, and post-execution pipeline.
+Proceed with phase-by-phase execution.
 """)
 ```
 
-**Step 3: Task state transfer**
+**If ExitPlanMode is rejected by the user:** Do NOT retry. Instead, present the plan path and task IDs and tell the user to run `/horde-implement` manually when ready.
 
-horde-implement **reuses** tasks created during planning (transfer mode):
-- Claims ownership: `TaskUpdate(taskId=X, owner="horde-implement")`
-- Updates status as work progresses
-- Preserves lineage from planning → execution → review
+### Why this flow works
 
-**Why not Path A?** horde-plan already generated the plan. Invoking Path A would redundantly call senior-prompt-engineer to generate another plan. Always use Path B when horde-plan produced the plan.
+The old flow had a double-approval problem:
+1. Plan mode's ExitPlanMode dialog asked "approve plan?"
+2. Then horde-implement waited for "proceed with execution?"
 
-### Handoff Announcement Template
+Users who said "approve all, implement this" got stuck in a loop of approval dialogs. The fix:
+- ExitPlanMode is called immediately (mechanical unlock, not approval)
+- Tasks are created DURING planning (not after)
+- horde-implement is auto-invoked (no second approval)
 
-```
-Handing off to horde-implement (Path B: Execute)...
+## Structured Handoff to Horde-Implement
 
-**Plan:** `docs/plans/YYYY-MM-DD-[feature].md`
-**Phases:** N (gate depths: {DEEP: 1, STANDARD: 2, LIGHT: 1, NONE: 1})
-**Tasks:** N (types: {bash: 4, code_write: 6, config: 2, verify: 2})
-**Task IDs:** {list of TaskCreate IDs for transfer}
+The handoff happens automatically in Phase 6 (see above). Key points:
 
-horde-implement will:
-1. Parse plan manifest from YAML frontmatter (skip re-discovery)
-2. Claim transferred tasks via TaskUpdate
-3. Execute phases with gate testing at STANDARD/DEEP boundaries
-4. Run post-execution: implementation-status → horde-test → horde-review
-```
+- **Always use Path B** — horde-plan already generated the plan. Path A would redundantly re-generate it.
+- **Tasks transfer automatically** — TaskCreate IDs from planning are passed to horde-implement, which claims them via `TaskUpdate(taskId=X, owner="horde-implement")`.
+- **No second approval** — the user approved during planning. horde-implement starts executing immediately.
 
 ### Fallback
 
-If horde-implement is not available or invocation fails:
+If horde-implement invocation fails:
 1. Present the plan document path to the user
-2. Suggest: "Run `/implement docs/plans/YYYY-MM-DD-[feature].md` in a new session"
+2. Suggest: "Run `/horde-implement` in a new session"
 3. Plan is self-contained — YAML frontmatter is optional (horde-implement falls back to markdown parsing)
 
 ## Task Domain Routing
@@ -1492,6 +1491,11 @@ Plan complete! Here's what I'll build:
 **Tasks:** 14 total across 5 phases
 **Gate depths:** STANDARD (Phase 1→2), STANDARD (Phase 2→4), LIGHT (Phase 3, 4), NONE (Phase 5)
 
+[Creating docs/plans directory if needed...]
+[Writing plan to disk...]
+
+**Plan saved:** `docs/plans/2026-02-04-user-profile-management.md`
+
 Handing off to horde-implement (Path B: Execute)...
 
 **Plan:** `docs/plans/2026-02-04-user-profile-management.md`
@@ -1514,12 +1518,13 @@ Shall I proceed with execution?
 
 **Always:**
 - Use EnterPlanMode before planning
-- Use ExitPlanMode for approval
-- Create tasks via TaskCreate for tracking
+- Call ExitPlanMode immediately when plan is complete (no redundant approval dialog)
+- Create TaskCreate entries for each phase DURING planning (these transfer to horde-implement)
 - Map dependencies with addBlockedBy
 - Specify exact file paths
 - Include testing in every plan
-- Hand off to horde-implement
+- **Save the plan to disk** using Write tool after ExitPlanMode
+- **Auto-invoke horde-implement** Path B immediately after saving
 
 ## Plan Revision Workflow
 
@@ -1660,11 +1665,10 @@ Claude:
 **Skill Relationship:**
 ```
 horde-brainstorming (explore options)
-  └── horde-plan v1.2 (create structured plan)
+  └── horde-plan v1.4 (create structured plan)
         ├── [Phase 2.5] golden-horde deliberation (validate architecture)
-        ├── [Output] Plan Output Contract (## phases, ### tasks, exit criteria, YAML manifest)
-        └── horde-implement Path B (execute plan — zero re-discovery)
-              ├── Plan Parser reads YAML frontmatter (skip structural inference)
+        ├── [Phase 3-5] Plan Output Contract + TaskCreate per phase
+        └── [Phase 6] ExitPlanMode → save plan → auto-invoke horde-implement Path B
               ├── Task transfer (reuse TaskCreate IDs via TaskUpdate)
               ├── Phase loop with gate testing (depths from manifest)
               └── Post-execution: implementation-status → horde-test → horde-review
